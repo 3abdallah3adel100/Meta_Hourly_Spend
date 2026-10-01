@@ -1442,13 +1442,11 @@ class TrackerSheet:
         self,
     ) -> list[list[Any]]:
         """
-        IMPORTANT:
-        Request UNFORMATTED values from Google Sheets.
+        Read FORMATTED values from Google Sheets.
 
-        Therefore a 66.41% cell normally comes back as 0.6641,
-        not the text "66.41%".
-
-        to_float() still also supports the formatted string as backup.
+        This keeps dates as strings like 2026-10-01 instead of Google
+        spreadsheet serial numbers. Percentages may come back like 66.97%,
+        and to_float() safely converts them to 0.6697.
         """
 
         return self.ws.get(
@@ -1456,7 +1454,7 @@ class TrackerSheet:
             f"{RAW_DATA_START}"
             f":AX",
             value_render_option=(
-                "UNFORMATTED_VALUE"
+                "FORMATTED_VALUE"
             ),
         )
 
@@ -1677,6 +1675,18 @@ class TrackerSheet:
             )
         )
 
+        overall_points = sum(
+            1
+            for matrix_row in overall_matrix
+            for value in matrix_row
+            if value != ""
+        )
+
+        print(
+            f"Overall matrix points loaded: "
+            f"{overall_points}"
+        )
+
         self.ws.update(
             OVERALL_MATRIX_RANGE,
             overall_matrix,
@@ -1725,6 +1735,19 @@ class TrackerSheet:
                     selected_code
                 ),
             )
+        )
+
+        agent_points = sum(
+            1
+            for matrix_row in agent_matrix
+            for value in matrix_row
+            if value != ""
+        )
+
+        print(
+            f"Agent matrix points loaded "
+            f"({selected_code}): "
+            f"{agent_points}"
         )
 
         self.ws.update(
