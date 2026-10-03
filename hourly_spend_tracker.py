@@ -58,7 +58,7 @@ INPUT_ROW_RANGE = "A9:M9"
 INPUT_STATUS_CELL = "M9"
 
 
-# Overall matrix
+# Overall percentage matrix
 # A13 = Day
 # B13:Y13 = hourly headers
 # B14:Y44 = 31 days x 24 hours
@@ -67,19 +67,41 @@ OVERALL_HOUR_HEADER_RANGE = "B13:Y13"
 OVERALL_MATRIX_RANGE = "B14:Y44"
 
 
-# Agent matrix
-# B48 = selected agent
-# A50 = Day
-# B50:Y50 = hourly headers
-# B51:Y81 = 31 days x 24 hours
-AGENT_SELECTOR_CELL = "B48"
-AGENT_DAY_HEADER_CELL = "A50"
-AGENT_HOUR_HEADER_RANGE = "B50:Y50"
-AGENT_MATRIX_RANGE = "B51:Y81"
+# Overall SPEND matrix — directly below the percentage table
+# A47 = title
+# A48 = Day
+# B48:Y48 = hourly headers
+# B49:Y79 = 31 days x 24 hours
+SPEND_TITLE_CELL = "A47"
+SPEND_DAY_HEADER_CELL = "A48"
+SPEND_HOUR_HEADER_RANGE = "B48:Y48"
+SPEND_MATRIX_RANGE = "B49:Y79"
 
 
-# Live agents snapshot
-SNAPSHOT_RANGE = "A86:I94"
+# Agent percentage matrix — moved lower to make room for spend table
+# A82 = section title
+# A83 = selector label
+# B83 = selected agent
+# A85 = Day
+# B85:Y85 = hourly headers
+# B86:Y116 = 31 days x 24 hours
+AGENT_TITLE_CELL = "A82"
+AGENT_SELECTOR_LABEL_CELL = "A83"
+AGENT_SELECTOR_CELL = "B83"
+AGENT_DAY_HEADER_CELL = "A85"
+AGENT_HOUR_HEADER_RANGE = "B85:Y85"
+AGENT_MATRIX_RANGE = "B86:Y116"
+
+
+# Live agents snapshot — moved lower
+SNAPSHOT_TITLE_CELL = "A119"
+SNAPSHOT_HEADER_RANGE = "A120:I120"
+SNAPSHOT_RANGE = "A121:I129"
+
+
+# Layout migration marker (Z is intentionally outside the visible matrix)
+LAYOUT_VERSION_CELL = "Z1"
+LAYOUT_VERSION = "V3_SPEND_12H_BACKFILL"
 
 
 # Internal Budget History
@@ -247,6 +269,66 @@ def parse_agent_header(
         return None
 
     return code, name
+
+
+def format_hour_12h(
+    hour: int,
+    minute: int = 0,
+) -> str:
+    """
+    24h numeric hour -> readable 12-hour label.
+
+    Examples:
+        0,55  -> 12:55 AM
+        1,55  -> 1:55 AM
+        12,55 -> 12:55 PM
+        17,55 -> 5:55 PM
+    """
+    dt = datetime(
+        2000,
+        1,
+        1,
+        hour,
+        minute,
+    )
+    return dt.strftime(
+        "%I:%M %p"
+    ).lstrip("0")
+
+
+def header_minute(
+    value: Any,
+    default: int = 0,
+) -> int:
+    """
+    Preserve the minute already shown in an hourly header.
+    Works with:
+        17:55
+        5:55 PM
+        0:55
+    """
+    raw = str(value or "").strip()
+
+    match = re.search(
+        r":(\d{2})",
+        raw,
+    )
+
+    if not match:
+        return default
+
+    try:
+        minute = int(
+            match.group(1)
+        )
+    except ValueError:
+        return default
+
+    return (
+        minute
+        if 0 <= minute <= 59
+        else default
+    )
 
 
 def normalize_account_id(
@@ -935,6 +1017,279 @@ class TrackerSheet:
 
 
     # --------------------------------------------------------
+    # VISIBLE LAYOUT / ONE-TIME MIGRATION
+    # --------------------------------------------------------
+
+    def ensure_visible_layout(
+        self,
+        agents: list[
+            dict[str, str]
+        ],
+    ) -> None:
+        """
+        V3 layout:
+        1) Overall percentage matrix
+        2) Overall spend matrix
+        3) Agent percentage matrix
+        4) Live agent snapshot
+
+        This migration runs only once per sheet.
+        """
+
+        current_version = str(
+            self.ws.acell(
+                LAYOUT_VERSION_CELL
+            ).value
+            or ""
+        ).strip()
+
+        # Preserve the old selector before clearing the old agent area.
+        old_selector = str(
+            self.ws.acell(
+                "B48"
+            ).value
+            or ""
+        ).strip()
+
+        if current_version != LAYOUT_VERSION:
+            try:
+                # Clear the OLD agent/snapshot area only.
+                # Budget input, overall %, history and raw log are untouched.
+                self.ws.batch_clear([
+                    "A47:Y129",
+                ])
+            except Exception:
+                pass
+
+            # Spend section
+            self.ws.update(
+                SPEND_TITLE_CELL,
+                [[
+                    "LIVE OVERALL SPEND — DAY × HOUR"
+                ]],
+            )
+
+            # Agent section
+            self.ws.update(
+                AGENT_TITLE_CELL,
+                [[
+                    "AGENT PACING VIEW — SELECT ONE AGENT"
+                ]],
+            )
+
+            self.ws.update(
+                AGENT_SELECTOR_LABEL_CELL,
+                [["Agent:"]],
+            )
+
+            parsed_old = (
+                parse_agent_header(
+                    old_selector
+                )
+            )
+
+            valid_codes = {
+                agent["code"]
+                for agent in agents
+            }
+
+            if (
+                parsed_old
+                and parsed_old[0]
+                in valid_codes
+            ):
+                selected_header = (
+                    old_selector
+                )
+            else:
+                selected_header = (
+                    agents[0][
+                        "header"
+                    ]
+                )
+
+            self.ws.update(
+                AGENT_SELECTOR_CELL,
+                [[selected_header]],
+            )
+
+            # Snapshot section
+            self.ws.update(
+                SNAPSHOT_TITLE_CELL,
+                [[
+                    "LIVE AGENT SNAPSHOT"
+                ]],
+            )
+
+            self.ws.update(
+                SNAPSHOT_HEADER_RANGE,
+                [[
+                    "Code",
+                    "Agent",
+                    "Budget",
+                    "Spend",
+                    "Used %",
+                    "Remaining",
+                    "Expected Pace %",
+                    "Pace Delta",
+                    "Status",
+                ]],
+            )
+
+            self.ws.update(
+                LAYOUT_VERSION_CELL,
+                [[LAYOUT_VERSION]],
+            )
+
+        # These labels/day numbers are cheap to enforce every run.
+        self.ws.update(
+            SPEND_TITLE_CELL,
+            [[
+                "LIVE OVERALL SPEND — DAY × HOUR"
+            ]],
+        )
+
+        self.ws.update(
+            AGENT_TITLE_CELL,
+            [[
+                "AGENT PACING VIEW — SELECT ONE AGENT"
+            ]],
+        )
+
+        self.ws.update(
+            AGENT_SELECTOR_LABEL_CELL,
+            [["Agent:"]],
+        )
+
+        self.ws.update(
+            SNAPSHOT_TITLE_CELL,
+            [[
+                "LIVE AGENT SNAPSHOT"
+            ]],
+        )
+
+        self.ws.update(
+            SNAPSHOT_HEADER_RANGE,
+            [[
+                "Code",
+                "Agent",
+                "Budget",
+                "Spend",
+                "Used %",
+                "Remaining",
+                "Expected Pace %",
+                "Pace Delta",
+                "Status",
+            ]],
+        )
+
+        day_values = [
+            [day]
+            for day in range(
+                1,
+                32,
+            )
+        ]
+
+        self.ws.update(
+            "A14:A44",
+            day_values,
+            value_input_option="USER_ENTERED",
+        )
+
+        self.ws.update(
+            "A49:A79",
+            day_values,
+            value_input_option="USER_ENTERED",
+        )
+
+        self.ws.update(
+            "A86:A116",
+            day_values,
+            value_input_option="USER_ENTERED",
+        )
+
+        # Basic formatting for the new visible sections.
+        # Cosmetic failures must never stop the tracker.
+        try:
+            self.ws.format(
+                "A47:Y47",
+                {
+                    "backgroundColor": {
+                        "red": 0.07,
+                        "green": 0.10,
+                        "blue": 0.16,
+                    },
+                    "textFormat": {
+                        "bold": True,
+                        "foregroundColor": {
+                            "red": 1,
+                            "green": 1,
+                            "blue": 1,
+                        },
+                    },
+                    "horizontalAlignment": "CENTER",
+                },
+            )
+
+            self.ws.format(
+                "A48:Y48",
+                {
+                    "backgroundColor": {
+                        "red": 0.15,
+                        "green": 0.39,
+                        "blue": 0.92,
+                    },
+                    "textFormat": {
+                        "bold": True,
+                        "foregroundColor": {
+                            "red": 1,
+                            "green": 1,
+                            "blue": 1,
+                        },
+                    },
+                    "horizontalAlignment": "CENTER",
+                },
+            )
+
+            self.ws.format(
+                SPEND_MATRIX_RANGE,
+                {
+                    "numberFormat": {
+                        "type": "NUMBER",
+                        "pattern": "#,##0.00",
+                    },
+                    "horizontalAlignment": "CENTER",
+                },
+            )
+
+            self.ws.format(
+                OVERALL_MATRIX_RANGE,
+                {
+                    "numberFormat": {
+                        "type": "PERCENT",
+                        "pattern": "0.00%",
+                    },
+                    "horizontalAlignment": "CENTER",
+                },
+            )
+
+            self.ws.format(
+                AGENT_MATRIX_RANGE,
+                {
+                    "numberFormat": {
+                        "type": "PERCENT",
+                        "pattern": "0.00%",
+                    },
+                    "horizontalAlignment": "CENTER",
+                },
+            )
+
+        except Exception:
+            pass
+
+
+    # --------------------------------------------------------
     # AUTOMATED HOUR HEADERS
     # --------------------------------------------------------
 
@@ -943,30 +1298,20 @@ class TrackerSheet:
         now: datetime,
     ) -> None:
         """
-        Hour labels are maintained automatically.
+        Maintain 24 hourly columns automatically in 12-hour format.
 
-        Initial/default:
-            00:00, 01:00, 02:00 ... 23:00
+        Examples with cron at :55:
+            12:55 AM
+            1:55 AM
+            ...
+            12:55 PM
+            1:55 PM
+            ...
+            11:55 PM
 
-        On every run, only the CURRENT hour gets the real update time.
-
-        Example:
-            Run at 16:55
-            -> hour 16 label becomes 16:55
-
-            Next scheduled run at 17:05
-            -> hour 17 label becomes 17:05
-
-        Previous hour labels are preserved.
-
-        This keeps the same 24-column matrix, while showing when
-        each hourly snapshot was actually refreshed.
+        The CURRENT hour gets the actual run minute.
+        Previous hours preserve their saved minute.
         """
-
-        default_headers = [
-            f"{hour:02d}:00"
-            for hour in range(24)
-        ]
 
         existing = (
             self.ws.get(
@@ -985,26 +1330,27 @@ class TrackerSheet:
         headers: list[str] = []
 
         for hour in range(24):
-
-            current_value = str(
-                existing[hour]
-                or ""
-            ).strip()
-
-            headers.append(
-                current_value
-                or default_headers[
-                    hour
-                ]
+            minute = header_minute(
+                existing[hour],
+                default=0,
             )
 
-        # Update current hour only
+            headers.append(
+                format_hour_12h(
+                    hour,
+                    minute,
+                )
+            )
+
+        # Current hour reflects the actual update minute.
         headers[
             now.hour
-        ] = now.strftime(
-            "%H:%M"
+        ] = format_hour_12h(
+            now.hour,
+            now.minute,
         )
 
+        # Overall percentage table
         self.ws.update(
             OVERALL_DAY_HEADER_CELL,
             [["Day"]],
@@ -1013,11 +1359,22 @@ class TrackerSheet:
         self.ws.update(
             OVERALL_HOUR_HEADER_RANGE,
             [headers],
-            value_input_option=(
-                "USER_ENTERED"
-            ),
+            value_input_option="USER_ENTERED",
         )
 
+        # Overall spend table
+        self.ws.update(
+            SPEND_DAY_HEADER_CELL,
+            [["Day"]],
+        )
+
+        self.ws.update(
+            SPEND_HOUR_HEADER_RANGE,
+            [headers],
+            value_input_option="USER_ENTERED",
+        )
+
+        # Agent percentage table
         self.ws.update(
             AGENT_DAY_HEADER_CELL,
             [["Day"]],
@@ -1026,9 +1383,7 @@ class TrackerSheet:
         self.ws.update(
             AGENT_HOUR_HEADER_RANGE,
             [headers],
-            value_input_option=(
-                "USER_ENTERED"
-            ),
+            value_input_option="USER_ENTERED",
         )
 
 
@@ -1137,6 +1492,43 @@ class TrackerSheet:
             saved_at,
         ]
 
+        # If this exact dated budget already exists and the values have
+        # not changed, do NOT rewrite it every hour. It remains the
+        # active carry-forward budget.
+        if target_row is not None:
+            existing_padded = (
+                list(
+                    history_values[
+                        target_row
+                        - HISTORY_DATA_START
+                    ]
+                )
+                + [""] * 13
+            )
+
+            old_values = [
+                str(value or "").strip()
+                for value
+                in existing_padded[:12]
+            ]
+
+            new_values = [
+                str(value or "").strip()
+                for value
+                in output[:12]
+            ]
+
+            if old_values == new_values:
+                self.ws.update(
+                    INPUT_STATUS_CELL,
+                    [[
+                        f"ACTIVE FROM "
+                        f"{budget_date}"
+                    ]],
+                )
+
+                return budget_date
+
         if target_row is None:
 
             target_row = (
@@ -1160,7 +1552,7 @@ class TrackerSheet:
         self.ws.update(
             INPUT_STATUS_CELL,
             [[
-                f"SAVED "
+                f"SAVED CHANGE "
                 f"{budget_date}"
             ]],
         )
@@ -1179,6 +1571,21 @@ class TrackerSheet:
             dict[str, str]
         ],
     ) -> dict[str, Any]:
+        """
+        Carry-forward budget logic.
+
+        The budget does NOT need to be entered every day.
+
+        Example:
+            2026-10-02 = 90,000
+            2026-10-03 = no new row
+            2026-10-04 = no new row
+
+        Effective budget on Oct 3 and Oct 4 remains 90,000.
+
+        When a newer dated budget is saved, it becomes the new default
+        from that date onward until another change is saved.
+        """
 
         rows = self.ws.get(
             f"AA"
@@ -1186,12 +1593,15 @@ class TrackerSheet:
             f":AM"
         )
 
-        matched: list[
-            Any
-        ] | None = None
+        target_dt = datetime.strptime(
+            target_date,
+            "%Y-%m-%d",
+        ).date()
+
+        latest_date: str | None = None
+        latest_row: list[Any] | None = None
 
         for row in rows:
-
             padded = (
                 list(row)
                 + [""] * (
@@ -1200,47 +1610,62 @@ class TrackerSheet:
                 )
             )
 
-            if (
+            row_date = (
                 parse_sheet_date(
                     padded[0]
                 )
-                == target_date
+            )
+
+            if not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}",
+                row_date,
             ):
-                matched = padded
+                continue
+
+            try:
+                row_dt = datetime.strptime(
+                    row_date,
+                    "%Y-%m-%d",
+                ).date()
+            except ValueError:
+                continue
+
+            # Only budgets effective on or before the requested date.
+            if row_dt > target_dt:
+                continue
+
+            if (
+                latest_date is None
+                or row_date > latest_date
+            ):
+                latest_date = row_date
+                latest_row = padded
 
         allocations: dict[
             str,
             float | None,
         ] = {
             agent["code"]: None
-            for agent
-            in agents
+            for agent in agents
         }
 
-        overall: float | None = (
-            None
-        )
+        overall: float | None = None
 
-        if matched is not None:
+        if latest_row is not None:
 
             overall_raw = str(
-                matched[1]
+                latest_row[1]
                 or ""
             ).strip()
 
             if overall_raw:
-
                 candidate = to_float(
                     overall_raw,
-                    default=float(
-                        "nan"
-                    ),
+                    default=float("nan"),
                 )
 
                 if (
-                    math.isfinite(
-                        candidate
-                    )
+                    math.isfinite(candidate)
                     and candidate >= 0
                 ):
                     overall = candidate
@@ -1254,7 +1679,7 @@ class TrackerSheet:
             ):
 
                 raw_value = str(
-                    matched[idx]
+                    latest_row[idx]
                     or ""
                 ).strip()
 
@@ -1263,15 +1688,11 @@ class TrackerSheet:
 
                 candidate = to_float(
                     raw_value,
-                    default=float(
-                        "nan"
-                    ),
+                    default=float("nan"),
                 )
 
                 if (
-                    math.isfinite(
-                        candidate
-                    )
+                    math.isfinite(candidate)
                     and candidate >= 0
                 ):
                     allocations[
@@ -1280,8 +1701,7 @@ class TrackerSheet:
 
         valid_agent_budgets = [
             value
-            for value
-            in allocations.values()
+            for value in allocations.values()
             if value is not None
         ]
 
@@ -1297,10 +1717,195 @@ class TrackerSheet:
             "overall": overall,
             "agents": allocations,
             "found": (
-                matched
+                latest_row
                 is not None
             ),
+            "source_date": latest_date,
+            "inherited": (
+                latest_date is not None
+                and latest_date != target_date
+            ),
         }
+
+
+    def read_budget_history(
+        self,
+        agents: list[
+            dict[str, str]
+        ],
+    ) -> dict[
+        str,
+        dict[str, Any],
+    ]:
+        """
+        Load budget CHANGE POINTS.
+
+        Each dated row means:
+        "Use these budgets from this date onward until another dated
+        budget row replaces them."
+
+        So there is no need to add one row every day.
+        """
+
+        rows = self.ws.get(
+            f"AA"
+            f"{HISTORY_DATA_START}"
+            f":AM"
+        )
+
+        result: dict[
+            str,
+            dict[str, Any],
+        ] = {}
+
+        for row in rows:
+            padded = (
+                list(row)
+                + [""] * (
+                    13
+                    - len(row)
+                )
+            )
+
+            date_value = (
+                parse_sheet_date(
+                    padded[0]
+                )
+            )
+
+            if not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}",
+                date_value,
+            ):
+                continue
+
+            overall: float | None = None
+
+            overall_raw = str(
+                padded[1]
+                or ""
+            ).strip()
+
+            if overall_raw:
+                candidate = to_float(
+                    overall_raw,
+                    default=float("nan"),
+                )
+
+                if (
+                    math.isfinite(candidate)
+                    and candidate >= 0
+                ):
+                    overall = candidate
+
+            allocations: dict[
+                str,
+                float | None,
+            ] = {
+                agent["code"]: None
+                for agent in agents
+            }
+
+            for idx, agent in enumerate(
+                agents,
+                start=2,
+            ):
+                raw_value = str(
+                    padded[idx]
+                    or ""
+                ).strip()
+
+                if not raw_value:
+                    continue
+
+                candidate = to_float(
+                    raw_value,
+                    default=float("nan"),
+                )
+
+                if (
+                    math.isfinite(candidate)
+                    and candidate >= 0
+                ):
+                    allocations[
+                        agent["code"]
+                    ] = candidate
+
+            valid_agent_budgets = [
+                value
+                for value in allocations.values()
+                if value is not None
+            ]
+
+            if (
+                overall is None
+                and valid_agent_budgets
+            ):
+                overall = sum(
+                    valid_agent_budgets
+                )
+
+            result[
+                date_value
+            ] = {
+                "overall": overall,
+                "agents": allocations,
+            }
+
+        return result
+
+
+    @staticmethod
+    def effective_budget_from_history(
+        budget_history: dict[
+            str,
+            dict[str, Any],
+        ],
+        target_date: str,
+        *,
+        scope: str,
+        agent_code: str | None = None,
+    ) -> float | None:
+        """
+        Resolve the latest budget change whose date is <= target_date.
+        """
+
+        effective_date: str | None = None
+        effective_record: dict[str, Any] | None = None
+
+        for date_value, record in budget_history.items():
+
+            if date_value > target_date:
+                continue
+
+            if (
+                effective_date is None
+                or date_value > effective_date
+            ):
+                effective_date = date_value
+                effective_record = record
+
+        if effective_record is None:
+            return None
+
+        if scope.upper() == "OVERALL":
+            return effective_record.get(
+                "overall"
+            )
+
+        if agent_code is None:
+            return None
+
+        return (
+            effective_record
+            .get(
+                "agents",
+                {},
+            )
+            .get(
+                agent_code
+            )
+        )
 
 
     # --------------------------------------------------------
@@ -1472,10 +2077,24 @@ class TrackerSheet:
         month: int,
         *,
         scope: str,
+        metric: str,
+        budget_history: dict[
+            str,
+            dict[str, Any],
+        ],
         agent_code: (
             str | None
         ) = None,
     ) -> list[list[Any]]:
+        """
+        metric:
+            "percent" -> Spend / the saved budget for THAT DATE
+            "spend"   -> cumulative Spend Today
+
+        Percentages are rebuilt from raw SPEND + Budget History whenever
+        possible. This means if the budget is entered later, older hourly
+        snapshots automatically backfill on the next run.
+        """
 
         matrix: list[
             list[Any]
@@ -1485,7 +2104,6 @@ class TrackerSheet:
         ]
 
         for row in raw_rows:
-
             padded = (
                 list(row)
                 + [""] * (
@@ -1511,7 +2129,6 @@ class TrackerSheet:
                     date_value,
                     "%Y-%m-%d",
                 )
-
             except ValueError:
                 continue
 
@@ -1532,21 +2149,17 @@ class TrackerSheet:
             ):
                 continue
 
+            row_code = str(
+                padded[3]
+                or ""
+            ).strip().upper()
+
             if (
-                agent_code
-                is not None
+                agent_code is not None
+                and row_code
+                != agent_code.upper()
             ):
-
-                row_code = str(
-                    padded[3]
-                    or ""
-                ).strip().upper()
-
-                if (
-                    row_code
-                    != agent_code.upper()
-                ):
-                    continue
+                continue
 
             hour_text = str(
                 padded[1]
@@ -1558,7 +2171,6 @@ class TrackerSheet:
                     hour_text
                     .split(":")[0]
                 )
-
             except (
                 ValueError,
                 IndexError,
@@ -1570,31 +2182,77 @@ class TrackerSheet:
             ):
                 continue
 
-            pct_raw = padded[7]
-
-            if (
-                pct_raw is None
-                or str(
-                    pct_raw
-                ).strip() == ""
-            ):
-                continue
-
-            pct_value = to_float(
-                pct_raw,
-                default=float(
-                    "nan"
-                ),
+            spend_value = to_float(
+                padded[5],
+                default=float("nan"),
             )
 
             if not math.isfinite(
-                pct_value
+                spend_value
             ):
                 continue
 
+            if metric == "spend":
+                value = spend_value
+
+            elif metric == "percent":
+                day_budget: float | None = None
+
+                day_budget = (
+                    TrackerSheet
+                    .effective_budget_from_history(
+                        budget_history,
+                        date_value,
+                        scope=scope,
+                        agent_code=(
+                            row_code
+                            if scope.upper()
+                            != "OVERALL"
+                            else None
+                        ),
+                    )
+                )
+
+                if (
+                    day_budget is not None
+                    and day_budget > 0
+                ):
+                    value = (
+                        spend_value
+                        / day_budget
+                    )
+
+                else:
+                    # Backward compatibility:
+                    # use the raw percentage if an older row already has one.
+                    pct_raw = padded[7]
+
+                    if (
+                        pct_raw is None
+                        or str(
+                            pct_raw
+                        ).strip() == ""
+                    ):
+                        continue
+
+                    value = to_float(
+                        pct_raw,
+                        default=float("nan"),
+                    )
+
+                    if not math.isfinite(
+                        value
+                    ):
+                        continue
+
+            else:
+                raise ValueError(
+                    f"Unsupported matrix metric: {metric}"
+                )
+
             matrix[
                 dt.day - 1
-            ][hour] = pct_value
+            ][hour] = value
 
         return matrix
 
@@ -1611,6 +2269,10 @@ class TrackerSheet:
         now: datetime,
         agents: list[
             dict[str, str]
+        ],
+        budget_history: dict[
+            str,
+            dict[str, Any],
         ],
     ) -> None:
 
@@ -1634,9 +2296,7 @@ class TrackerSheet:
                     raw_year
                 )
             )
-
         except ValueError:
-
             year = now.year
 
             self.ws.update(
@@ -1645,7 +2305,6 @@ class TrackerSheet:
             )
 
         try:
-
             month = int(
                 float(
                     raw_month
@@ -1658,7 +2317,6 @@ class TrackerSheet:
                 raise ValueError
 
         except ValueError:
-
             month = now.month
 
             self.ws.update(
@@ -1666,12 +2324,20 @@ class TrackerSheet:
                 [[month]],
             )
 
+        # ====================================================
+        # OVERALL PERCENTAGE MATRIX
+        # ====================================================
+
         overall_matrix = (
             self.build_matrix(
                 raw_rows,
                 year,
                 month,
                 scope="OVERALL",
+                metric="percent",
+                budget_history=(
+                    budget_history
+                ),
             )
         )
 
@@ -1683,17 +2349,57 @@ class TrackerSheet:
         )
 
         print(
-            f"Overall matrix points loaded: "
+            "Overall percentage "
+            "matrix points loaded: "
             f"{overall_points}"
         )
 
         self.ws.update(
             OVERALL_MATRIX_RANGE,
             overall_matrix,
-            value_input_option=(
-                "USER_ENTERED"
-            ),
+            value_input_option="USER_ENTERED",
         )
+
+        # ====================================================
+        # OVERALL SPEND MATRIX
+        # This works EVEN when a daily budget is missing.
+        # ====================================================
+
+        spend_matrix = (
+            self.build_matrix(
+                raw_rows,
+                year,
+                month,
+                scope="OVERALL",
+                metric="spend",
+                budget_history=(
+                    budget_history
+                ),
+            )
+        )
+
+        spend_points = sum(
+            1
+            for matrix_row in spend_matrix
+            for value in matrix_row
+            if value != ""
+        )
+
+        print(
+            "Overall spend "
+            "matrix points loaded: "
+            f"{spend_points}"
+        )
+
+        self.ws.update(
+            SPEND_MATRIX_RANGE,
+            spend_matrix,
+            value_input_option="USER_ENTERED",
+        )
+
+        # ====================================================
+        # AGENT PERCENTAGE MATRIX
+        # ====================================================
 
         selected = str(
             self.ws.acell(
@@ -1702,11 +2408,22 @@ class TrackerSheet:
             or ""
         ).strip()
 
-        parsed = parse_agent_header(
-            selected
+        parsed = (
+            parse_agent_header(
+                selected
+            )
         )
 
-        if parsed:
+        valid_codes = {
+            agent["code"]
+            for agent in agents
+        }
+
+        if (
+            parsed
+            and parsed[0]
+            in valid_codes
+        ):
             selected_code = (
                 parsed[0]
             )
@@ -1731,6 +2448,10 @@ class TrackerSheet:
                 year,
                 month,
                 scope="AGENT",
+                metric="percent",
+                budget_history=(
+                    budget_history
+                ),
                 agent_code=(
                     selected_code
                 ),
@@ -1745,7 +2466,8 @@ class TrackerSheet:
         )
 
         print(
-            f"Agent matrix points loaded "
+            "Agent percentage "
+            f"matrix points loaded "
             f"({selected_code}): "
             f"{agent_points}"
         )
@@ -1753,9 +2475,7 @@ class TrackerSheet:
         self.ws.update(
             AGENT_MATRIX_RANGE,
             agent_matrix,
-            value_input_option=(
-                "USER_ENTERED"
-            ),
+            value_input_option="USER_ENTERED",
         )
 
 
@@ -2239,8 +2959,12 @@ def main() -> int:
         agents
     )
 
-    # AUTO HOURS
-    # No manual editing for 00:00 / 01:00 / etc.
+    # One-time layout migration + visible table setup.
+    sheet.ensure_visible_layout(
+        agents
+    )
+
+    # AUTO HOURS — 12-hour format.
     sheet.sync_hour_headers(
         now
     )
@@ -2260,6 +2984,14 @@ def main() -> int:
         .read_budget_for_date(
             today,
             agents,
+        )
+    )
+
+    # Load ALL dated budgets once for percentage backfill.
+    budget_history = (
+        sheet
+        .read_budget_history(
+            agents
         )
     )
 
@@ -2426,8 +3158,8 @@ def main() -> int:
         hour_bucket,
     )
 
-    # Read raw rows as UNFORMATTED values.
-    # This fixes Google % parsing.
+    # Read formatted raw rows.
+    # Dates stay readable and percentage strings are parsed safely.
     all_raw = (
         sheet.raw_rows()
     )
@@ -2441,6 +3173,7 @@ def main() -> int:
         all_raw,
         now,
         agents,
+        budget_history,
     )
 
 
@@ -2512,6 +3245,13 @@ def main() -> int:
     print(
         "Today's budget found: "
         f"{budget['found']}"
+    )
+
+    print(
+        "Budget source date: "
+        f"{budget.get('source_date') or 'NONE'}"
+        f" | inherited="
+        f"{budget.get('inherited', False)}"
     )
 
     print(
