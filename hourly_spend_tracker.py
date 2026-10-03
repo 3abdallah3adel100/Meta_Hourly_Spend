@@ -906,6 +906,103 @@ class TrackerSheet:
             )
 
 
+    def batch_write(
+        self,
+        data: list[
+            dict[str, Any]
+        ],
+        *,
+        value_input_option: str = "USER_ENTERED",
+        attempts: int = 5,
+    ) -> None:
+        """
+        Write many ranges in ONE Google Sheets request.
+
+        This is the main protection against Sheets write quota errors.
+
+        Example data item:
+            {
+                "range": "A1:B2",
+                "values": [[1, 2], [3, 4]]
+            }
+
+        On HTTP 429, wait and retry automatically.
+        """
+
+        if not data:
+            return
+
+        last_error: Exception | None = None
+
+        for attempt in range(
+            1,
+            attempts + 1,
+        ):
+            try:
+                self.ws.batch_update(
+                    data,
+                    value_input_option=(
+                        value_input_option
+                    ),
+                )
+                return
+
+            except gspread.exceptions.APIError as exc:
+                last_error = exc
+
+                response = getattr(
+                    exc,
+                    "response",
+                    None,
+                )
+
+                status_code = getattr(
+                    response,
+                    "status_code",
+                    None,
+                )
+
+                is_quota_error = (
+                    status_code == 429
+                    or "429" in str(exc)
+                    or "Quota exceeded"
+                    in str(exc)
+                )
+
+                if not is_quota_error:
+                    raise
+
+                if attempt >= attempts:
+                    break
+
+                wait_seconds = min(
+                    60,
+                    10 * (
+                        2 ** (
+                            attempt - 1
+                        )
+                    ),
+                )
+
+                print(
+                    "Google Sheets write quota "
+                    f"hit (429). Waiting "
+                    f"{wait_seconds}s before "
+                    f"retry {attempt + 1}/"
+                    f"{attempts}..."
+                )
+
+                time.sleep(
+                    wait_seconds
+                )
+
+        raise RuntimeError(
+            "Google Sheets write quota "
+            "still exceeded after retries: "
+            f"{last_error}"
+        )
+
+
     # --------------------------------------------------------
     # AGENT DEFINITIONS
     # --------------------------------------------------------
@@ -992,11 +1089,6 @@ class TrackerSheet:
             "Saved At",
         ]
 
-        self.ws.update(
-            HISTORY_HEADER_RANGE,
-            [history_headers],
-        )
-
         raw_headers = [
             "Date",
             "Hour",
@@ -1010,10 +1102,24 @@ class TrackerSheet:
             "Updated At",
         ]
 
-        self.ws.update(
-            RAW_HEADER_RANGE,
-            [raw_headers],
-        )
+        self.batch_write([
+            {
+                "range": (
+                    HISTORY_HEADER_RANGE
+                ),
+                "values": [
+                    history_headers
+                ],
+            },
+            {
+                "range": (
+                    RAW_HEADER_RANGE
+                ),
+                "values": [
+                    raw_headers
+                ],
+            },
+        ])
 
 
     # --------------------------------------------------------
@@ -1027,13 +1133,11 @@ class TrackerSheet:
         ],
     ) -> None:
         """
-        V3 layout:
-        1) Overall percentage matrix
-        2) Overall spend matrix
-        3) Agent percentage matrix
-        4) Live agent snapshot
+        One-time visible layout migration.
 
-        This migration runs only once per sheet.
+        IMPORTANT:
+        Static labels/day numbers are NOT rewritten every hour anymore.
+        This dramatically reduces Google Sheets write quota usage.
         """
 
         current_version = str(
@@ -1043,7 +1147,13 @@ class TrackerSheet:
             or ""
         ).strip()
 
-        # Preserve the old selector before clearing the old agent area.
+        if (
+            current_version
+            == LAYOUT_VERSION
+        ):
+            return
+
+        # Preserve the old selector before clearing old lower sections.
         old_selector = str(
             self.ws.acell(
                 "B48"
@@ -1051,79 +1161,95 @@ class TrackerSheet:
             or ""
         ).strip()
 
-        if current_version != LAYOUT_VERSION:
-            try:
-                # Clear the OLD agent/snapshot area only.
-                # Budget input, overall %, history and raw log are untouched.
-                self.ws.batch_clear([
-                    "A47:Y129",
-                ])
-            except Exception:
-                pass
+        parsed_old = (
+            parse_agent_header(
+                old_selector
+            )
+        )
 
-            # Spend section
-            self.ws.update(
-                SPEND_TITLE_CELL,
-                [[
-                    "LIVE OVERALL SPEND — DAY × HOUR"
+        valid_codes = {
+            agent["code"]
+            for agent in agents
+        }
+
+        if (
+            parsed_old
+            and parsed_old[0]
+            in valid_codes
+        ):
+            selected_header = (
+                old_selector
+            )
+        else:
+            selected_header = (
+                agents[0][
+                    "header"
+                ]
+            )
+
+        try:
+            self.ws.batch_clear([
+                "A47:Y129",
+            ])
+        except Exception:
+            pass
+
+        day_values = [
+            [day]
+            for day in range(
+                1,
+                32,
+            )
+        ]
+
+        self.batch_write([
+            {
+                "range": (
+                    SPEND_TITLE_CELL
+                ),
+                "values": [[
+                    "LIVE OVERALL SPEND "
+                    "— DAY × HOUR"
                 ]],
-            )
-
-            # Agent section
-            self.ws.update(
-                AGENT_TITLE_CELL,
-                [[
-                    "AGENT PACING VIEW — SELECT ONE AGENT"
+            },
+            {
+                "range": (
+                    AGENT_TITLE_CELL
+                ),
+                "values": [[
+                    "AGENT PACING VIEW "
+                    "— SELECT ONE AGENT"
                 ]],
-            )
-
-            self.ws.update(
-                AGENT_SELECTOR_LABEL_CELL,
-                [["Agent:"]],
-            )
-
-            parsed_old = (
-                parse_agent_header(
-                    old_selector
-                )
-            )
-
-            valid_codes = {
-                agent["code"]
-                for agent in agents
-            }
-
-            if (
-                parsed_old
-                and parsed_old[0]
-                in valid_codes
-            ):
-                selected_header = (
-                    old_selector
-                )
-            else:
-                selected_header = (
-                    agents[0][
-                        "header"
-                    ]
-                )
-
-            self.ws.update(
-                AGENT_SELECTOR_CELL,
-                [[selected_header]],
-            )
-
-            # Snapshot section
-            self.ws.update(
-                SNAPSHOT_TITLE_CELL,
-                [[
+            },
+            {
+                "range": (
+                    AGENT_SELECTOR_LABEL_CELL
+                ),
+                "values": [[
+                    "Agent:"
+                ]],
+            },
+            {
+                "range": (
+                    AGENT_SELECTOR_CELL
+                ),
+                "values": [[
+                    selected_header
+                ]],
+            },
+            {
+                "range": (
+                    SNAPSHOT_TITLE_CELL
+                ),
+                "values": [[
                     "LIVE AGENT SNAPSHOT"
                 ]],
-            )
-
-            self.ws.update(
-                SNAPSHOT_HEADER_RANGE,
-                [[
+            },
+            {
+                "range": (
+                    SNAPSHOT_HEADER_RANGE
+                ),
+                "values": [[
                     "Code",
                     "Agent",
                     "Budget",
@@ -1134,83 +1260,32 @@ class TrackerSheet:
                     "Pace Delta",
                     "Status",
                 ]],
-            )
+            },
+            {
+                "range": "A14:A44",
+                "values": day_values,
+            },
+            {
+                "range": "A49:A79",
+                "values": day_values,
+            },
+            {
+                "range": "A86:A116",
+                "values": day_values,
+            },
+            {
+                "range": (
+                    LAYOUT_VERSION_CELL
+                ),
+                "values": [[
+                    LAYOUT_VERSION
+                ]],
+            },
+        ])
 
-            self.ws.update(
-                LAYOUT_VERSION_CELL,
-                [[LAYOUT_VERSION]],
-            )
-
-        # These labels/day numbers are cheap to enforce every run.
-        self.ws.update(
-            SPEND_TITLE_CELL,
-            [[
-                "LIVE OVERALL SPEND — DAY × HOUR"
-            ]],
-        )
-
-        self.ws.update(
-            AGENT_TITLE_CELL,
-            [[
-                "AGENT PACING VIEW — SELECT ONE AGENT"
-            ]],
-        )
-
-        self.ws.update(
-            AGENT_SELECTOR_LABEL_CELL,
-            [["Agent:"]],
-        )
-
-        self.ws.update(
-            SNAPSHOT_TITLE_CELL,
-            [[
-                "LIVE AGENT SNAPSHOT"
-            ]],
-        )
-
-        self.ws.update(
-            SNAPSHOT_HEADER_RANGE,
-            [[
-                "Code",
-                "Agent",
-                "Budget",
-                "Spend",
-                "Used %",
-                "Remaining",
-                "Expected Pace %",
-                "Pace Delta",
-                "Status",
-            ]],
-        )
-
-        day_values = [
-            [day]
-            for day in range(
-                1,
-                32,
-            )
-        ]
-
-        self.ws.update(
-            "A14:A44",
-            day_values,
-            value_input_option="USER_ENTERED",
-        )
-
-        self.ws.update(
-            "A49:A79",
-            day_values,
-            value_input_option="USER_ENTERED",
-        )
-
-        self.ws.update(
-            "A86:A116",
-            day_values,
-            value_input_option="USER_ENTERED",
-        )
-
-        # Basic formatting for the new visible sections.
-        # Cosmetic failures must never stop the tracker.
+        # Formatting only once during migration.
+        # A few formatting writes here are safe because this path
+        # does not run hourly after the version marker is set.
         try:
             self.ws.format(
                 "A47:Y47",
@@ -1257,9 +1332,13 @@ class TrackerSheet:
                 {
                     "numberFormat": {
                         "type": "NUMBER",
-                        "pattern": "#,##0.00",
+                        "pattern": (
+                            "#,##0.00"
+                        ),
                     },
-                    "horizontalAlignment": "CENTER",
+                    "horizontalAlignment": (
+                        "CENTER"
+                    ),
                 },
             )
 
@@ -1270,7 +1349,9 @@ class TrackerSheet:
                         "type": "PERCENT",
                         "pattern": "0.00%",
                     },
-                    "horizontalAlignment": "CENTER",
+                    "horizontalAlignment": (
+                        "CENTER"
+                    ),
                 },
             )
 
@@ -1281,7 +1362,9 @@ class TrackerSheet:
                         "type": "PERCENT",
                         "pattern": "0.00%",
                     },
-                    "horizontalAlignment": "CENTER",
+                    "horizontalAlignment": (
+                        "CENTER"
+                    ),
                 },
             )
 
@@ -1298,19 +1381,12 @@ class TrackerSheet:
         now: datetime,
     ) -> None:
         """
-        Maintain 24 hourly columns automatically in 12-hour format.
+        Maintain the 24 hourly columns automatically in 12-hour format.
 
-        Examples with cron at :55:
-            12:55 AM
-            1:55 AM
-            ...
-            12:55 PM
-            1:55 PM
-            ...
-            11:55 PM
+        Example with cron around :55:
+            12:55 AM, 1:55 AM ... 12:55 PM ... 11:55 PM
 
-        The CURRENT hour gets the actual run minute.
-        Previous hours preserve their saved minute.
+        All three visible tables receive the same header row in ONE write.
         """
 
         existing = (
@@ -1342,7 +1418,6 @@ class TrackerSheet:
                 )
             )
 
-        # Current hour reflects the actual update minute.
         headers[
             now.hour
         ] = format_hour_12h(
@@ -1350,41 +1425,44 @@ class TrackerSheet:
             now.minute,
         )
 
-        # Overall percentage table
-        self.ws.update(
-            OVERALL_DAY_HEADER_CELL,
-            [["Day"]],
-        )
-
-        self.ws.update(
-            OVERALL_HOUR_HEADER_RANGE,
-            [headers],
-            value_input_option="USER_ENTERED",
-        )
-
-        # Overall spend table
-        self.ws.update(
-            SPEND_DAY_HEADER_CELL,
-            [["Day"]],
-        )
-
-        self.ws.update(
-            SPEND_HOUR_HEADER_RANGE,
-            [headers],
-            value_input_option="USER_ENTERED",
-        )
-
-        # Agent percentage table
-        self.ws.update(
-            AGENT_DAY_HEADER_CELL,
-            [["Day"]],
-        )
-
-        self.ws.update(
-            AGENT_HOUR_HEADER_RANGE,
-            [headers],
-            value_input_option="USER_ENTERED",
-        )
+        self.batch_write([
+            {
+                "range": (
+                    OVERALL_DAY_HEADER_CELL
+                ),
+                "values": [["Day"]],
+            },
+            {
+                "range": (
+                    OVERALL_HOUR_HEADER_RANGE
+                ),
+                "values": [headers],
+            },
+            {
+                "range": (
+                    SPEND_DAY_HEADER_CELL
+                ),
+                "values": [["Day"]],
+            },
+            {
+                "range": (
+                    SPEND_HOUR_HEADER_RANGE
+                ),
+                "values": [headers],
+            },
+            {
+                "range": (
+                    AGENT_DAY_HEADER_CELL
+                ),
+                "values": [["Day"]],
+            },
+            {
+                "range": (
+                    AGENT_HOUR_HEADER_RANGE
+                ),
+                "values": [headers],
+            },
+        ])
 
 
     # --------------------------------------------------------
@@ -1420,12 +1498,16 @@ class TrackerSheet:
         )
 
         if not budget_date:
-
-            self.ws.update(
-                INPUT_STATUS_CELL,
-                [["NO DATE"]],
-            )
-
+            self.batch_write([
+                {
+                    "range": (
+                        INPUT_STATUS_CELL
+                    ),
+                    "values": [[
+                        "NO DATE"
+                    ]],
+                },
+            ])
             return ""
 
         meaningful_values = [
@@ -1439,14 +1521,16 @@ class TrackerSheet:
         if not any(
             meaningful_values
         ):
-
-            self.ws.update(
-                INPUT_STATUS_CELL,
-                [[
-                    "NO BUDGETS ENTERED"
-                ]],
-            )
-
+            self.batch_write([
+                {
+                    "range": (
+                        INPUT_STATUS_CELL
+                    ),
+                    "values": [[
+                        "NO BUDGETS ENTERED"
+                    ]],
+                },
+            ])
             return budget_date
 
         history_values = (
@@ -1468,7 +1552,6 @@ class TrackerSheet:
             history_values,
             start=HISTORY_DATA_START,
         ):
-
             if not existing:
                 continue
 
@@ -1492,9 +1575,6 @@ class TrackerSheet:
             saved_at,
         ]
 
-        # If this exact dated budget already exists and the values have
-        # not changed, do NOT rewrite it every hour. It remains the
-        # active carry-forward budget.
         if target_row is not None:
             existing_padded = (
                 list(
@@ -1507,30 +1587,44 @@ class TrackerSheet:
             )
 
             old_values = [
-                str(value or "").strip()
+                str(
+                    value or ""
+                ).strip()
                 for value
-                in existing_padded[:12]
+                in existing_padded[
+                    :12
+                ]
             ]
 
             new_values = [
-                str(value or "").strip()
+                str(
+                    value or ""
+                ).strip()
                 for value
-                in output[:12]
+                in output[
+                    :12
+                ]
             ]
 
-            if old_values == new_values:
-                self.ws.update(
-                    INPUT_STATUS_CELL,
-                    [[
-                        f"ACTIVE FROM "
-                        f"{budget_date}"
-                    ]],
-                )
+            if (
+                old_values
+                == new_values
+            ):
+                self.batch_write([
+                    {
+                        "range": (
+                            INPUT_STATUS_CELL
+                        ),
+                        "values": [[
+                            f"ACTIVE FROM "
+                            f"{budget_date}"
+                        ]],
+                    },
+                ])
 
                 return budget_date
 
         if target_row is None:
-
             target_row = (
                 HISTORY_DATA_START
                 + len(
@@ -1538,24 +1632,24 @@ class TrackerSheet:
                 )
             )
 
-        self.ws.update(
-            (
-                f"AA{target_row}"
-                f":AM{target_row}"
-            ),
-            [output],
-            value_input_option=(
-                "USER_ENTERED"
-            ),
-        )
-
-        self.ws.update(
-            INPUT_STATUS_CELL,
-            [[
-                f"SAVED CHANGE "
-                f"{budget_date}"
-            ]],
-        )
+        self.batch_write([
+            {
+                "range": (
+                    f"AA{target_row}"
+                    f":AM{target_row}"
+                ),
+                "values": [output],
+            },
+            {
+                "range": (
+                    INPUT_STATUS_CELL
+                ),
+                "values": [[
+                    f"SAVED CHANGE "
+                    f"{budget_date}"
+                ]],
+            },
+        ])
 
         return budget_date
 
@@ -1921,11 +2015,10 @@ class TrackerSheet:
         hour_bucket: str,
     ) -> None:
         """
-        Unique hourly key:
-            Date + Hour Bucket + Agent Code
+        Upsert ALL Overall + Agent raw rows in ONE Sheets write request.
 
-        So multiple runs in the same hour UPDATE the existing row
-        instead of creating duplicates.
+        Unique key:
+            Date + Hour Bucket + Agent Code
         """
 
         existing = self.ws.get(
@@ -1945,18 +2038,17 @@ class TrackerSheet:
 
         for (
             offset,
-            row,
+            existing_row,
         ) in enumerate(
             existing,
             start=RAW_DATA_START,
         ):
 
             padded = (
-                list(row)
-                + [""] * (
-                    10
-                    - len(row)
+                list(
+                    existing_row
                 )
+                + [""] * 10
             )
 
             key = (
@@ -1980,6 +2072,10 @@ class TrackerSheet:
                     key
                 ] = offset
 
+        batch_data: list[
+            dict[str, Any]
+        ] = []
+
         append_rows: list[
             list[Any]
         ] = []
@@ -2002,45 +2098,45 @@ class TrackerSheet:
             )
 
             if target:
-
-                self.ws.update(
-                    (
+                batch_data.append({
+                    "range": (
                         f"AO{target}"
                         f":AX{target}"
                     ),
-                    [row],
-                    value_input_option=(
-                        "USER_ENTERED"
-                    ),
-                )
-
+                    "values": [row],
+                })
             else:
                 append_rows.append(
                     row
                 )
 
-        if not append_rows:
-            return
-
-        next_row = (
-            RAW_DATA_START
-            + len(existing)
-        )
-
-        for row in append_rows:
-
-            self.ws.update(
-                (
-                    f"AO{next_row}"
-                    f":AX{next_row}"
-                ),
-                [row],
-                value_input_option=(
-                    "USER_ENTERED"
-                ),
+        if append_rows:
+            next_row = (
+                RAW_DATA_START
+                + len(existing)
             )
 
-            next_row += 1
+            end_row = (
+                next_row
+                + len(
+                    append_rows
+                )
+                - 1
+            )
+
+            batch_data.append({
+                "range": (
+                    f"AO{next_row}"
+                    f":AX{end_row}"
+                ),
+                "values": (
+                    append_rows
+                ),
+            })
+
+        self.batch_write(
+            batch_data
+        )
 
 
     def raw_rows(
@@ -2290,6 +2386,10 @@ class TrackerSheet:
             or ""
         ).strip()
 
+        extra_writes: list[
+            dict[str, Any]
+        ] = []
+
         try:
             year = int(
                 float(
@@ -2299,10 +2399,12 @@ class TrackerSheet:
         except ValueError:
             year = now.year
 
-            self.ws.update(
-                VIEW_YEAR_CELL,
-                [[year]],
-            )
+            extra_writes.append({
+                "range": (
+                    VIEW_YEAR_CELL
+                ),
+                "values": [[year]],
+            })
 
         try:
             month = int(
@@ -2319,14 +2421,12 @@ class TrackerSheet:
         except ValueError:
             month = now.month
 
-            self.ws.update(
-                VIEW_MONTH_CELL,
-                [[month]],
-            )
-
-        # ====================================================
-        # OVERALL PERCENTAGE MATRIX
-        # ====================================================
+            extra_writes.append({
+                "range": (
+                    VIEW_MONTH_CELL
+                ),
+                "values": [[month]],
+            })
 
         overall_matrix = (
             self.build_matrix(
@@ -2343,8 +2443,10 @@ class TrackerSheet:
 
         overall_points = sum(
             1
-            for matrix_row in overall_matrix
-            for value in matrix_row
+            for matrix_row
+            in overall_matrix
+            for value
+            in matrix_row
             if value != ""
         )
 
@@ -2353,17 +2455,6 @@ class TrackerSheet:
             "matrix points loaded: "
             f"{overall_points}"
         )
-
-        self.ws.update(
-            OVERALL_MATRIX_RANGE,
-            overall_matrix,
-            value_input_option="USER_ENTERED",
-        )
-
-        # ====================================================
-        # OVERALL SPEND MATRIX
-        # This works EVEN when a daily budget is missing.
-        # ====================================================
 
         spend_matrix = (
             self.build_matrix(
@@ -2380,8 +2471,10 @@ class TrackerSheet:
 
         spend_points = sum(
             1
-            for matrix_row in spend_matrix
-            for value in matrix_row
+            for matrix_row
+            in spend_matrix
+            for value
+            in matrix_row
             if value != ""
         )
 
@@ -2390,16 +2483,6 @@ class TrackerSheet:
             "matrix points loaded: "
             f"{spend_points}"
         )
-
-        self.ws.update(
-            SPEND_MATRIX_RANGE,
-            spend_matrix,
-            value_input_option="USER_ENTERED",
-        )
-
-        # ====================================================
-        # AGENT PERCENTAGE MATRIX
-        # ====================================================
 
         selected = str(
             self.ws.acell(
@@ -2416,7 +2499,8 @@ class TrackerSheet:
 
         valid_codes = {
             agent["code"]
-            for agent in agents
+            for agent
+            in agents
         }
 
         if (
@@ -2433,14 +2517,16 @@ class TrackerSheet:
                 agents[0]["code"]
             )
 
-            self.ws.update(
-                AGENT_SELECTOR_CELL,
-                [[
+            extra_writes.append({
+                "range": (
+                    AGENT_SELECTOR_CELL
+                ),
+                "values": [[
                     agents[0][
                         "header"
                     ]
                 ]],
-            )
+            })
 
         agent_matrix = (
             self.build_matrix(
@@ -2460,8 +2546,10 @@ class TrackerSheet:
 
         agent_points = sum(
             1
-            for matrix_row in agent_matrix
-            for value in matrix_row
+            for matrix_row
+            in agent_matrix
+            for value
+            in matrix_row
             if value != ""
         )
 
@@ -2472,11 +2560,33 @@ class TrackerSheet:
             f"{agent_points}"
         )
 
-        self.ws.update(
-            AGENT_MATRIX_RANGE,
-            agent_matrix,
-            value_input_option="USER_ENTERED",
-        )
+        self.batch_write([
+            *extra_writes,
+            {
+                "range": (
+                    OVERALL_MATRIX_RANGE
+                ),
+                "values": (
+                    overall_matrix
+                ),
+            },
+            {
+                "range": (
+                    SPEND_MATRIX_RANGE
+                ),
+                "values": (
+                    spend_matrix
+                ),
+            },
+            {
+                "range": (
+                    AGENT_MATRIX_RANGE
+                ),
+                "values": (
+                    agent_matrix
+                ),
+            },
+        ])
 
 
     # --------------------------------------------------------
@@ -2498,7 +2608,6 @@ class TrackerSheet:
             is not None
             and overall_budget > 0
         ):
-
             spend_ratio: (
                 float | str
             ) = (
@@ -2512,92 +2621,77 @@ class TrackerSheet:
                 overall_budget
                 - overall_spend
             )
-
         else:
             spend_ratio = ""
             remaining = ""
 
-        values = {
-            LIVE_OVERALL_CELL: (
-                spend_ratio
-            ),
-            SPEND_TODAY_CELL: round(
-                overall_spend,
-                2,
-            ),
-            TODAY_BUDGET_CELL: (
-                round(
-                    overall_budget,
-                    2,
-                )
-                if (
-                    overall_budget
-                    is not None
-                )
-                else "NO BUDGET"
-            ),
-            REMAINING_CELL: (
-                round(
-                    float(
-                        remaining
-                    ),
-                    2,
-                )
-                if remaining != ""
-                else ""
-            ),
-            LAST_UPDATE_CELL: (
-                updated_at
-            ),
-        }
-
-        for (
-            cell,
-            value,
-        ) in values.items():
-
-            self.ws.update(
-                cell,
-                [[value]],
-                value_input_option=(
-                    "USER_ENTERED"
+        self.batch_write([
+            {
+                "range": (
+                    LIVE_OVERALL_CELL
                 ),
-            )
-
-        try:
-
-            self.ws.format(
-                "G5:J5",
-                {
-                    "numberFormat": {
-                        "type": (
-                            "PERCENT"
-                        ),
-                        "pattern": (
-                            "0.00%"
-                        ),
-                    }
-                },
-            )
-
-            self.ws.format(
-                "K5:V5",
-                {
-                    "numberFormat": {
-                        "type": (
-                            "NUMBER"
-                        ),
-                        "pattern": (
-                            "#,##0.00"
-                        ),
-                    }
-                },
-            )
-
-        except Exception:
-            # Formatting is cosmetic.
-            # Never fail the run for it.
-            pass
+                "values": [[
+                    spend_ratio
+                ]],
+            },
+            {
+                "range": (
+                    SPEND_TODAY_CELL
+                ),
+                "values": [[
+                    round(
+                        overall_spend,
+                        2,
+                    )
+                ]],
+            },
+            {
+                "range": (
+                    TODAY_BUDGET_CELL
+                ),
+                "values": [[
+                    (
+                        round(
+                            overall_budget,
+                            2,
+                        )
+                        if (
+                            overall_budget
+                            is not None
+                        )
+                        else "NO BUDGET"
+                    )
+                ]],
+            },
+            {
+                "range": (
+                    REMAINING_CELL
+                ),
+                "values": [[
+                    (
+                        round(
+                            float(
+                                remaining
+                            ),
+                            2,
+                        )
+                        if (
+                            remaining
+                            != ""
+                        )
+                        else ""
+                    )
+                ]],
+            },
+            {
+                "range": (
+                    LAST_UPDATE_CELL
+                ),
+                "values": [[
+                    updated_at
+                ]],
+            },
+        ])
 
 
     # --------------------------------------------------------
@@ -2743,13 +2837,16 @@ class TrackerSheet:
                 [""] * 9
             )
 
-        self.ws.update(
-            SNAPSHOT_RANGE,
-            output[:9],
-            value_input_option=(
-                "USER_ENTERED"
-            ),
-        )
+        self.batch_write([
+            {
+                "range": (
+                    SNAPSHOT_RANGE
+                ),
+                "values": (
+                    output[:9]
+                ),
+            },
+        ])
 
 
 # ============================================================
@@ -3262,6 +3359,11 @@ def main() -> int:
     print(
         "Accounts fetched: "
         f"{len(spend_rows)}"
+    )
+
+    print(
+        "Google Sheets writes: "
+        "optimized with batch updates"
     )
 
     print(
