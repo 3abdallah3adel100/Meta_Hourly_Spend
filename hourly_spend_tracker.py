@@ -101,7 +101,7 @@ SNAPSHOT_RANGE = "A121:I129"
 
 # Layout migration marker (Z is intentionally outside the visible matrix)
 LAYOUT_VERSION_CELL = "Z1"
-LAYOUT_VERSION = "V3_SPEND_12H_BACKFILL"
+LAYOUT_VERSION = "V6_PRO_DESIGN_REPAIR"
 
 
 # Internal Budget History
@@ -885,14 +885,14 @@ class TrackerSheet:
             credentials
         )
 
-        book = gc.open_by_key(
+        self.book = gc.open_by_key(
             required_env(
                 "GOOGLE_SHEET_ID"
             )
         )
 
         try:
-            self.ws = book.worksheet(
+            self.ws = self.book.worksheet(
                 SHEET_TAB
             )
 
@@ -1123,6 +1123,1218 @@ class TrackerSheet:
 
 
     # --------------------------------------------------------
+    # PROFESSIONAL DESIGN REPAIR — ONE TIME ONLY
+    # --------------------------------------------------------
+
+    def apply_professional_design(
+        self,
+        agents: list[
+            dict[str, str]
+        ],
+    ) -> None:
+        """
+        Fix all visual leftovers from previous layouts in one Sheets
+        batchUpdate request:
+
+        - Remove old merged cells that collide with new tables.
+        - Remove old conditional-format rules that were coloring Spend.
+        - Remove the old Agent dropdown from the Spend hour header.
+        - Merge the new section titles correctly.
+        - Apply full-width styles to every header.
+        - Apply correct number formats.
+        - Add clean percentage heatmaps only to percentage tables.
+        - Add proper Agent selector dropdown at B83.
+        - Hide internal Z:AX helper columns.
+
+        This runs only when LAYOUT_VERSION changes, not every hour.
+        """
+
+        sheet_id = self.ws.id
+
+        # ----------------------------------------------------
+        # Read current merges + conditional rules
+        # ----------------------------------------------------
+        metadata = self.book.fetch_sheet_metadata(
+            params={
+                "fields": (
+                    "sheets("
+                    "properties(sheetId),"
+                    "merges,"
+                    "conditionalFormats"
+                    ")"
+                )
+            }
+        )
+
+        current_sheet_meta: dict[str, Any] = {}
+
+        for item in metadata.get(
+            "sheets",
+            [],
+        ):
+            if (
+                item.get(
+                    "properties",
+                    {},
+                ).get(
+                    "sheetId"
+                )
+                == sheet_id
+            ):
+                current_sheet_meta = item
+                break
+
+        requests_list: list[
+            dict[str, Any]
+        ] = []
+
+        # ----------------------------------------------------
+        # Delete old conditional formatting.
+        #
+        # We recreate the two correct heatmaps below.
+        # Delete from last index -> first because indexes shift.
+        # ----------------------------------------------------
+        conditional_rules = (
+            current_sheet_meta.get(
+                "conditionalFormats",
+                [],
+            )
+            or []
+        )
+
+        for index in reversed(
+            range(
+                len(
+                    conditional_rules
+                )
+            )
+        ):
+            requests_list.append({
+                "deleteConditionalFormatRule": {
+                    "sheetId": (
+                        sheet_id
+                    ),
+                    "index": index,
+                }
+            })
+
+        # ----------------------------------------------------
+        # Remove existing merges in the redesigned lower area.
+        #
+        # This is important because the OLD Agent selector was
+        # B48:E48. B48:E48 is now our Spend hour header and was
+        # causing 12:55 / 1:55 / 2:55 / 3:55 to collapse.
+        # ----------------------------------------------------
+        for merge_range in (
+            current_sheet_meta.get(
+                "merges",
+                [],
+            )
+            or []
+        ):
+            start_row = (
+                merge_range.get(
+                    "startRowIndex",
+                    0,
+                )
+            )
+            end_row = (
+                merge_range.get(
+                    "endRowIndex",
+                    start_row + 1,
+                )
+            )
+
+            start_col = (
+                merge_range.get(
+                    "startColumnIndex",
+                    0,
+                )
+            )
+            end_col = (
+                merge_range.get(
+                    "endColumnIndex",
+                    start_col + 1,
+                )
+            )
+
+            # Redesigned visual zone = rows 47:129, columns A:Y
+            intersects = (
+                end_row > 46
+                and start_row < 129
+                and end_col > 0
+                and start_col < 25
+            )
+
+            if intersects:
+                requests_list.append({
+                    "unmergeCells": {
+                        "range": (
+                            merge_range
+                        )
+                    }
+                })
+
+        # ----------------------------------------------------
+        # Clear the old dropdown/data validation from B48:E48.
+        # ----------------------------------------------------
+        requests_list.append({
+            "setDataValidation": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 47,
+                    "endRowIndex": 48,
+                    "startColumnIndex": 1,
+                    "endColumnIndex": 5,
+                },
+                "rule": None,
+            }
+        })
+
+        # ----------------------------------------------------
+        # Reset visual formatting in redesigned area.
+        # This wipes old purple/green/orange formatting residue.
+        # ----------------------------------------------------
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 46,
+                    "endRowIndex": 129,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 25,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 1,
+                            "green": 1,
+                            "blue": 1,
+                        },
+                        "textFormat": {
+                            "foregroundColor": {
+                                "red": 0.08,
+                                "green": 0.10,
+                                "blue": 0.15,
+                            },
+                            "fontSize": 9,
+                            "bold": False,
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                        "verticalAlignment": (
+                            "MIDDLE"
+                        ),
+                        "wrapStrategy": "CLIP",
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat."
+                    "backgroundColor,"
+                    "userEnteredFormat."
+                    "textFormat,"
+                    "userEnteredFormat."
+                    "horizontalAlignment,"
+                    "userEnteredFormat."
+                    "verticalAlignment,"
+                    "userEnteredFormat."
+                    "wrapStrategy"
+                ),
+            }
+        })
+
+        # ----------------------------------------------------
+        # Also standardize existing Overall Percentage table
+        # header and number format.
+        # ----------------------------------------------------
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 12,
+                    "endRowIndex": 13,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 25,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.10,
+                            "green": 0.38,
+                            "blue": 0.88,
+                        },
+                        "textFormat": {
+                            "foregroundColor": {
+                                "red": 1,
+                                "green": 1,
+                                "blue": 1,
+                            },
+                            "fontSize": 9,
+                            "bold": True,
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                        "verticalAlignment": (
+                            "MIDDLE"
+                        ),
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat."
+                    "backgroundColor,"
+                    "userEnteredFormat."
+                    "textFormat,"
+                    "userEnteredFormat."
+                    "horizontalAlignment,"
+                    "userEnteredFormat."
+                    "verticalAlignment"
+                ),
+            }
+        })
+
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 13,
+                    "endRowIndex": 44,
+                    "startColumnIndex": 1,
+                    "endColumnIndex": 25,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {
+                            "type": (
+                                "PERCENT"
+                            ),
+                            "pattern": (
+                                "0.00%"
+                            ),
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat."
+                    "numberFormat,"
+                    "userEnteredFormat."
+                    "horizontalAlignment"
+                ),
+            }
+        })
+
+        # ----------------------------------------------------
+        # SPEND TITLE A47:Y47
+        # ----------------------------------------------------
+        requests_list.append({
+            "mergeCells": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 46,
+                    "endRowIndex": 47,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 25,
+                },
+                "mergeType": "MERGE_ALL",
+            }
+        })
+
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 46,
+                    "endRowIndex": 47,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 25,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.07,
+                            "green": 0.10,
+                            "blue": 0.16,
+                        },
+                        "textFormat": {
+                            "foregroundColor": {
+                                "red": 1,
+                                "green": 1,
+                                "blue": 1,
+                            },
+                            "fontSize": 11,
+                            "bold": True,
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                        "verticalAlignment": (
+                            "MIDDLE"
+                        ),
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat"
+                ),
+            }
+        })
+
+        # Spend hour header A48:Y48
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 47,
+                    "endRowIndex": 48,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 25,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.10,
+                            "green": 0.38,
+                            "blue": 0.88,
+                        },
+                        "textFormat": {
+                            "foregroundColor": {
+                                "red": 1,
+                                "green": 1,
+                                "blue": 1,
+                            },
+                            "fontSize": 9,
+                            "bold": True,
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                        "verticalAlignment": (
+                            "MIDDLE"
+                        ),
+                        "wrapStrategy": "CLIP",
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat"
+                ),
+            }
+        })
+
+        # Spend data number format B49:Y79
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 48,
+                    "endRowIndex": 79,
+                    "startColumnIndex": 1,
+                    "endColumnIndex": 25,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {
+                            "type": "NUMBER",
+                            "pattern": (
+                                "#,##0.00"
+                            ),
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat."
+                    "numberFormat,"
+                    "userEnteredFormat."
+                    "horizontalAlignment"
+                ),
+            }
+        })
+
+        # Day labels for Spend
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 48,
+                    "endRowIndex": 79,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.96,
+                            "green": 0.97,
+                            "blue": 0.98,
+                        },
+                        "textFormat": {
+                            "bold": True,
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat"
+                ),
+            }
+        })
+
+        # ----------------------------------------------------
+        # AGENT TITLE A82:Y82
+        # ----------------------------------------------------
+        requests_list.append({
+            "mergeCells": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 81,
+                    "endRowIndex": 82,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 25,
+                },
+                "mergeType": "MERGE_ALL",
+            }
+        })
+
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 81,
+                    "endRowIndex": 82,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 25,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.30,
+                            "green": 0.12,
+                            "blue": 0.62,
+                        },
+                        "textFormat": {
+                            "foregroundColor": {
+                                "red": 1,
+                                "green": 1,
+                                "blue": 1,
+                            },
+                            "fontSize": 11,
+                            "bold": True,
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                        "verticalAlignment": (
+                            "MIDDLE"
+                        ),
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat"
+                ),
+            }
+        })
+
+        # Agent selector label A83
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 82,
+                    "endRowIndex": 83,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.20,
+                            "green": 0.22,
+                            "blue": 0.27,
+                        },
+                        "textFormat": {
+                            "foregroundColor": {
+                                "red": 1,
+                                "green": 1,
+                                "blue": 1,
+                            },
+                            "bold": True,
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat"
+                ),
+            }
+        })
+
+        # Merge B83:E83 for a clean selector box.
+        requests_list.append({
+            "mergeCells": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 82,
+                    "endRowIndex": 83,
+                    "startColumnIndex": 1,
+                    "endColumnIndex": 5,
+                },
+                "mergeType": "MERGE_ALL",
+            }
+        })
+
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 82,
+                    "endRowIndex": 83,
+                    "startColumnIndex": 1,
+                    "endColumnIndex": 5,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.95,
+                            "green": 0.93,
+                            "blue": 1,
+                        },
+                        "textFormat": {
+                            "foregroundColor": {
+                                "red": 0.16,
+                                "green": 0.08,
+                                "blue": 0.35,
+                            },
+                            "bold": True,
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                        "verticalAlignment": (
+                            "MIDDLE"
+                        ),
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat"
+                ),
+            }
+        })
+
+        # Correct dropdown at B83
+        validation_values = [
+            {
+                "userEnteredValue": (
+                    agent[
+                        "header"
+                    ]
+                )
+            }
+            for agent in agents
+        ]
+
+        requests_list.append({
+            "setDataValidation": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 82,
+                    "endRowIndex": 83,
+                    "startColumnIndex": 1,
+                    "endColumnIndex": 2,
+                },
+                "rule": {
+                    "condition": {
+                        "type": (
+                            "ONE_OF_LIST"
+                        ),
+                        "values": (
+                            validation_values
+                        ),
+                    },
+                    "strict": True,
+                    "showCustomUi": True,
+                },
+            }
+        })
+
+        # Agent hour header A85:Y85 — FULL WIDTH, not only A:I
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 84,
+                    "endRowIndex": 85,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 25,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.43,
+                            "green": 0.14,
+                            "blue": 0.78,
+                        },
+                        "textFormat": {
+                            "foregroundColor": {
+                                "red": 1,
+                                "green": 1,
+                                "blue": 1,
+                            },
+                            "fontSize": 9,
+                            "bold": True,
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                        "verticalAlignment": (
+                            "MIDDLE"
+                        ),
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat"
+                ),
+            }
+        })
+
+        # Agent percentage data
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 85,
+                    "endRowIndex": 116,
+                    "startColumnIndex": 1,
+                    "endColumnIndex": 25,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {
+                            "type": (
+                                "PERCENT"
+                            ),
+                            "pattern": (
+                                "0.00%"
+                            ),
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat."
+                    "numberFormat,"
+                    "userEnteredFormat."
+                    "horizontalAlignment"
+                ),
+            }
+        })
+
+        # Agent day labels
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 85,
+                    "endRowIndex": 116,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.96,
+                            "green": 0.97,
+                            "blue": 0.98,
+                        },
+                        "textFormat": {
+                            "bold": True,
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat"
+                ),
+            }
+        })
+
+        # ----------------------------------------------------
+        # SNAPSHOT TITLE A119:I119
+        # ----------------------------------------------------
+        requests_list.append({
+            "mergeCells": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 118,
+                    "endRowIndex": 119,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 9,
+                },
+                "mergeType": "MERGE_ALL",
+            }
+        })
+
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 118,
+                    "endRowIndex": 119,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 9,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.05,
+                            "green": 0.33,
+                            "blue": 0.30,
+                        },
+                        "textFormat": {
+                            "foregroundColor": {
+                                "red": 1,
+                                "green": 1,
+                                "blue": 1,
+                            },
+                            "fontSize": 11,
+                            "bold": True,
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                        "verticalAlignment": (
+                            "MIDDLE"
+                        ),
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat"
+                ),
+            }
+        })
+
+        # Snapshot headers A120:I120
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 119,
+                    "endRowIndex": 120,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 9,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.07,
+                            "green": 0.47,
+                            "blue": 0.42,
+                        },
+                        "textFormat": {
+                            "foregroundColor": {
+                                "red": 1,
+                                "green": 1,
+                                "blue": 1,
+                            },
+                            "fontSize": 9,
+                            "bold": True,
+                        },
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                        "verticalAlignment": (
+                            "MIDDLE"
+                        ),
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat"
+                ),
+            }
+        })
+
+        # Snapshot data row alignment/wrapping
+        requests_list.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 120,
+                    "endRowIndex": 129,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 9,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "horizontalAlignment": (
+                            "CENTER"
+                        ),
+                        "verticalAlignment": (
+                            "MIDDLE"
+                        ),
+                        "wrapStrategy": "WRAP",
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat."
+                    "horizontalAlignment,"
+                    "userEnteredFormat."
+                    "verticalAlignment,"
+                    "userEnteredFormat."
+                    "wrapStrategy"
+                ),
+            }
+        })
+
+        # Snapshot number formats
+        requests_list.extend([
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 120,
+                        "endRowIndex": 129,
+                        "startColumnIndex": 2,
+                        "endColumnIndex": 4,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": (
+                                    "NUMBER"
+                                ),
+                                "pattern": (
+                                    "#,##0.00"
+                                ),
+                            }
+                        }
+                    },
+                    "fields": (
+                        "userEnteredFormat."
+                        "numberFormat"
+                    ),
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 120,
+                        "endRowIndex": 129,
+                        "startColumnIndex": 4,
+                        "endColumnIndex": 5,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": (
+                                    "PERCENT"
+                                ),
+                                "pattern": (
+                                    "0.00%"
+                                ),
+                            }
+                        }
+                    },
+                    "fields": (
+                        "userEnteredFormat."
+                        "numberFormat"
+                    ),
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 120,
+                        "endRowIndex": 129,
+                        "startColumnIndex": 5,
+                        "endColumnIndex": 6,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": (
+                                    "NUMBER"
+                                ),
+                                "pattern": (
+                                    "#,##0.00"
+                                ),
+                            }
+                        }
+                    },
+                    "fields": (
+                        "userEnteredFormat."
+                        "numberFormat"
+                    ),
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 120,
+                        "endRowIndex": 129,
+                        "startColumnIndex": 6,
+                        "endColumnIndex": 8,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": (
+                                    "PERCENT"
+                                ),
+                                "pattern": (
+                                    "0.00%"
+                                ),
+                            }
+                        }
+                    },
+                    "fields": (
+                        "userEnteredFormat."
+                        "numberFormat"
+                    ),
+                }
+            },
+        ])
+
+        # ----------------------------------------------------
+        # Borders around visible data tables
+        # ----------------------------------------------------
+        border_style = {
+            "style": "SOLID",
+            "color": {
+                "red": 0.84,
+                "green": 0.86,
+                "blue": 0.90,
+            },
+        }
+
+        for grid_range in (
+            {
+                "sheetId": sheet_id,
+                "startRowIndex": 12,
+                "endRowIndex": 44,
+                "startColumnIndex": 0,
+                "endColumnIndex": 25,
+            },
+            {
+                "sheetId": sheet_id,
+                "startRowIndex": 47,
+                "endRowIndex": 79,
+                "startColumnIndex": 0,
+                "endColumnIndex": 25,
+            },
+            {
+                "sheetId": sheet_id,
+                "startRowIndex": 84,
+                "endRowIndex": 116,
+                "startColumnIndex": 0,
+                "endColumnIndex": 25,
+            },
+            {
+                "sheetId": sheet_id,
+                "startRowIndex": 119,
+                "endRowIndex": 129,
+                "startColumnIndex": 0,
+                "endColumnIndex": 9,
+            },
+        ):
+            requests_list.append({
+                "updateBorders": {
+                    "range": grid_range,
+                    "top": border_style,
+                    "bottom": border_style,
+                    "left": border_style,
+                    "right": border_style,
+                    "innerHorizontal": (
+                        border_style
+                    ),
+                    "innerVertical": (
+                        border_style
+                    ),
+                }
+            })
+
+        # ----------------------------------------------------
+        # Column widths:
+        # A = Day / labels
+        # B:Y = all 24 hour columns consistently.
+        # ----------------------------------------------------
+        requests_list.extend([
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": (
+                            "COLUMNS"
+                        ),
+                        "startIndex": 0,
+                        "endIndex": 1,
+                    },
+                    "properties": {
+                        "pixelSize": 64,
+                    },
+                    "fields": (
+                        "pixelSize"
+                    ),
+                }
+            },
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": (
+                            "COLUMNS"
+                        ),
+                        "startIndex": 1,
+                        "endIndex": 25,
+                    },
+                    "properties": {
+                        "pixelSize": 82,
+                    },
+                    "fields": (
+                        "pixelSize"
+                    ),
+                }
+            },
+        ])
+
+        # Title/header row heights.
+        for start_index, end_index, size in (
+            (46, 47, 28),
+            (47, 48, 24),
+            (81, 82, 28),
+            (82, 83, 26),
+            (84, 85, 24),
+            (118, 119, 28),
+            (119, 120, 25),
+        ):
+            requests_list.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": (
+                            start_index
+                        ),
+                        "endIndex": (
+                            end_index
+                        ),
+                    },
+                    "properties": {
+                        "pixelSize": size,
+                    },
+                    "fields": "pixelSize",
+                }
+            })
+
+        # ----------------------------------------------------
+        # Hide internal helper columns Z:AX.
+        # The user-facing dashboard remains A:Y only.
+        # ----------------------------------------------------
+        requests_list.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 25,
+                    "endIndex": 50,
+                },
+                "properties": {
+                    "hiddenByUser": True,
+                },
+                "fields": "hiddenByUser",
+            }
+        })
+
+        # ----------------------------------------------------
+        # Recreate CLEAN percentage heatmaps only.
+        # No heatmap on Spend table.
+        # ----------------------------------------------------
+        percentage_ranges = [
+            {
+                "sheetId": sheet_id,
+                "startRowIndex": 13,
+                "endRowIndex": 44,
+                "startColumnIndex": 1,
+                "endColumnIndex": 25,
+            },
+            {
+                "sheetId": sheet_id,
+                "startRowIndex": 85,
+                "endRowIndex": 116,
+                "startColumnIndex": 1,
+                "endColumnIndex": 25,
+            },
+        ]
+
+        for grid_range in (
+            percentage_ranges
+        ):
+            requests_list.append({
+                "addConditionalFormatRule": {
+                    "rule": {
+                        "ranges": [
+                            grid_range
+                        ],
+                        "gradientRule": {
+                            "minpoint": {
+                                "color": {
+                                    "red": 0.86,
+                                    "green": 0.93,
+                                    "blue": 1.00,
+                                },
+                                "type": "NUMBER",
+                                "value": "0",
+                            },
+                            "midpoint": {
+                                "color": {
+                                    "red": 1.00,
+                                    "green": 0.94,
+                                    "blue": 0.70,
+                                },
+                                "type": "NUMBER",
+                                "value": "0.5",
+                            },
+                            "maxpoint": {
+                                "color": {
+                                    "red": 1.00,
+                                    "green": 0.80,
+                                    "blue": 0.80,
+                                },
+                                "type": "NUMBER",
+                                "value": "1",
+                            },
+                        },
+                    },
+                    "index": 0,
+                }
+            })
+
+        # ----------------------------------------------------
+        # One Google Sheets batchUpdate for the full visual repair.
+        # ----------------------------------------------------
+        if requests_list:
+            self.book.batch_update({
+                "requests": (
+                    requests_list
+                )
+            })
+
+
+    # --------------------------------------------------------
     # VISIBLE LAYOUT / ONE-TIME MIGRATION
     # --------------------------------------------------------
 
@@ -1133,11 +2345,9 @@ class TrackerSheet:
         ],
     ) -> None:
         """
-        One-time visible layout migration.
+        Migrate/repair the visible dashboard exactly once for V6.
 
-        IMPORTANT:
-        Static labels/day numbers are NOT rewritten every hour anymore.
-        This dramatically reduces Google Sheets write quota usage.
+        Hourly runs after migration do NOT repeat this formatting.
         """
 
         current_version = str(
@@ -1153,17 +2363,26 @@ class TrackerSheet:
         ):
             return
 
-        # Preserve the old selector before clearing old lower sections.
-        old_selector = str(
+        # Prefer the current V5 selector at B83.
+        # Fall back to old B48 only for older layouts.
+        current_selector = str(
             self.ws.acell(
-                "B48"
+                AGENT_SELECTOR_CELL
             ).value
             or ""
         ).strip()
 
-        parsed_old = (
+        if not current_selector:
+            current_selector = str(
+                self.ws.acell(
+                    "B48"
+                ).value
+                or ""
+            ).strip()
+
+        parsed_selector = (
             parse_agent_header(
-                old_selector
+                current_selector
             )
         )
 
@@ -1173,12 +2392,12 @@ class TrackerSheet:
         }
 
         if (
-            parsed_old
-            and parsed_old[0]
+            parsed_selector
+            and parsed_selector[0]
             in valid_codes
         ):
             selected_header = (
-                old_selector
+                current_selector
             )
         else:
             selected_header = (
@@ -1187,6 +2406,8 @@ class TrackerSheet:
                 ]
             )
 
+        # Values in the matrices can safely be rebuilt from the Raw Log.
+        # Clear the redesigned lower visible area before rebuilding.
         try:
             self.ws.batch_clear([
                 "A47:Y129",
@@ -1202,7 +2423,15 @@ class TrackerSheet:
             )
         ]
 
+        # Update the carry-forward budget title too.
         self.batch_write([
+            {
+                "range": "A7",
+                "values": [[
+                    "BUDGET / ALLOCATION CHANGE "
+                    "— EDIT ONLY WHEN VALUES CHANGE"
+                ]],
+            },
             {
                 "range": (
                     SPEND_TITLE_CELL
@@ -1273,6 +2502,15 @@ class TrackerSheet:
                 "range": "A86:A116",
                 "values": day_values,
             },
+        ])
+
+        # One-time structural/design repair.
+        self.apply_professional_design(
+            agents
+        )
+
+        # Mark migration only AFTER successful design repair.
+        self.batch_write([
             {
                 "range": (
                     LAYOUT_VERSION_CELL
@@ -1282,94 +2520,6 @@ class TrackerSheet:
                 ]],
             },
         ])
-
-        # Formatting only once during migration.
-        # A few formatting writes here are safe because this path
-        # does not run hourly after the version marker is set.
-        try:
-            self.ws.format(
-                "A47:Y47",
-                {
-                    "backgroundColor": {
-                        "red": 0.07,
-                        "green": 0.10,
-                        "blue": 0.16,
-                    },
-                    "textFormat": {
-                        "bold": True,
-                        "foregroundColor": {
-                            "red": 1,
-                            "green": 1,
-                            "blue": 1,
-                        },
-                    },
-                    "horizontalAlignment": "CENTER",
-                },
-            )
-
-            self.ws.format(
-                "A48:Y48",
-                {
-                    "backgroundColor": {
-                        "red": 0.15,
-                        "green": 0.39,
-                        "blue": 0.92,
-                    },
-                    "textFormat": {
-                        "bold": True,
-                        "foregroundColor": {
-                            "red": 1,
-                            "green": 1,
-                            "blue": 1,
-                        },
-                    },
-                    "horizontalAlignment": "CENTER",
-                },
-            )
-
-            self.ws.format(
-                SPEND_MATRIX_RANGE,
-                {
-                    "numberFormat": {
-                        "type": "NUMBER",
-                        "pattern": (
-                            "#,##0.00"
-                        ),
-                    },
-                    "horizontalAlignment": (
-                        "CENTER"
-                    ),
-                },
-            )
-
-            self.ws.format(
-                OVERALL_MATRIX_RANGE,
-                {
-                    "numberFormat": {
-                        "type": "PERCENT",
-                        "pattern": "0.00%",
-                    },
-                    "horizontalAlignment": (
-                        "CENTER"
-                    ),
-                },
-            )
-
-            self.ws.format(
-                AGENT_MATRIX_RANGE,
-                {
-                    "numberFormat": {
-                        "type": "PERCENT",
-                        "pattern": "0.00%",
-                    },
-                    "horizontalAlignment": (
-                        "CENTER"
-                    ),
-                },
-            )
-
-        except Exception:
-            pass
 
 
     # --------------------------------------------------------
@@ -3056,7 +4206,7 @@ def main() -> int:
         agents
     )
 
-    # One-time layout migration + visible table setup.
+    # One-time V6 design repair + visible table setup.
     sheet.ensure_visible_layout(
         agents
     )
